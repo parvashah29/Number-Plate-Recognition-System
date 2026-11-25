@@ -1,86 +1,75 @@
-# Number Plate Detection System
+# Number Plate Recognition System
 
-A lightweight number plate detection system that works without GPU requirements. This system uses OpenCV for image processing and Tesseract for text recognition, making it suitable for CPU-only environments.
+Detects licence plates with a fine-tuned **YOLOv8n** model (Ultralytics) and reads them with **EasyOCR**
+(default, pure pip) or **Tesseract** (optional, detected at runtime). Works on images, folders, video files and webcam;
+uses Apple MPS / CUDA when available, otherwise CPU.
 
-## Features
+| Input | Output |
+|---|---|
+| ![input](assets/sample_input.jpg) | ![output](assets/sample_output.jpg) |
 
-- License plate detection using OpenCV image processing
-- Text extraction using Tesseract OCR
-- Support for multiple image formats (PNG, JPG, JPEG)
-- Confidence scores for detected text
+## Quick start
 
-## Setup
-
-1. Create a virtual environment:
-```powershell
-python -m venv venv
-.\venv\Scripts\Activate
-```
-
-2. Install dependencies:
-```powershell
+```bash
+git clone https://github.com/parvashah29/Number-Plate-Recognition-System.git
+cd Number-Plate-Recognition-System
+python3 -m venv venv && source venv/bin/activate      # Windows: venv\Scripts\activate
 pip install -r requirements.txt
+
+python main.py --source assets/sample_input.jpg        # image
+python main.py --source path/to/video.mp4 --no-display # video (annotated copy in output_results/)
+python main.py --source 0                              # webcam, press q to quit
 ```
 
-## Usage
+The trained weights ship with the repo (`models/plate_best.pt`, ~6 MB). EasyOCR downloads its small English models
+on first use. Tested on Python 3.12, macOS arm64 (clean venv install + test suite).
 
-1. Create a folder named `test_images` in the project directory
-2. Place your test images in the `test_images` folder
-3. Run the main script:
-```powershell
-python main.py
+Useful flags: `--weights`, `--ocr {auto,easyocr,tesseract}`, `--device {auto,cpu,mps,cuda}`, `--conf`, `--stride`,
+`--max-frames`, `--no-display` (also automatic fallback on headless OpenCV), `--debug`. Run `python main.py --help`.
+
+Outputs (all git-ignored): annotated media in `output_results/`, unique plate crops in `detected_plates/`,
+per-video logs in `plate_logs/`. In video mode the same plate (or a one-character OCR variation of it) is logged once.
+
+Optional Tesseract: `brew install tesseract` / `apt install tesseract-ocr`, then `pip install pytesseract`
+and `--ocr tesseract`. The code does not require it.
+
+## How it works
+
+- `license_plate_detection.py` - `LicensePlateDetector`: YOLO detection, crop, CLAHE/upscale preprocessing, OCR with
+  several image variants, plate-text validation (4-10 alphanumerics with letters and digits; light repair of O/0, I/1
+  confusions for Indian plate layouts such as `MH01AB1234`), de-duplication across video frames.
+- `main.py` - CLI. `train.py` - fine-tune (`python train.py --data-root archive`). `evaluate_model.py` - metrics below.
+- `plate_detection.py` - optional classical OpenCV contour detector (not used by the main pipeline).
+
+## Dataset (not included)
+
+The model was trained on a licence-plate detection dataset in YOLO format (1525 train / 169 val images, one class,
+many frames from Indian road video). Download it yourself and arrange it as
+`archive/images/{train,val}` and `archive/labels/{train,val}`, then run `python train.py`.
+
+## Measured results
+
+Detection, validation split (169 images, `python evaluate_model.py --limit 0`): precision 0.988, recall 0.988 at IoU 0.5.
+Training log mAP50 at epoch 100: 0.993.
+
+OCR: the dataset has boxes only, no plate text. I hand-read 29 crops from 30 evenly spaced validation images
+(one crop unreadable even to me) and compared: **10/29 exact matches (34%), character accuracy 67%**.
+Across all 169 validation detections the OCR returned a valid-looking plate string for 86% (read rate, not accuracy).
+OCR is the weak part: blurry, small, dark or two-line plates are often misread (`MH`/`HH`, `0`/`O`, `6`/`8`).
+Detection is solid; treat OCR text as a best guess. Throughput is roughly 1 s per plate on Apple MPS.
+
+![PR curve](assets/PR_curve.png)
+
+## Tests
+
+```bash
+pip install -r requirements-dev.txt
+pytest
 ```
 
-The script will process all images in the `test_images` folder and display the detected license plate text along with confidence scores.
-
-## Project Structure
-
-- **main.py**: The entry point for the application. It uses argparse to allow users to specify a video source (webcam or video file) and initializes the LicensePlateDetector from license_plate_detection.py.
-- **license_plate_detection.py**: Contains the main LicensePlateDetector class. It handles the detection of license plates using a YOLO model, preprocessing of images, OCR using Tesseract, and saving/logging of detected plates.
-
-- **plate_detection.py**: Uses classical image processing techniques (contours, Canny, etc.) to detect license plates. It is independent of the YOLO model and can be used as an alternative detection method.
-
-- **train.py**: Contains the logic for training or fine-tuning the YOLO model on a custom dataset. It uses the dataset configuration from dataset.yaml.
-
-- **dataset.yaml**: Configuration file for the dataset used in training the YOLO model. It specifies the paths to the training and validation images and the class names.
-
-## Model Performance
-
-The model's performance is evaluated using various metrics, which are stored in the `runs/detects/license_plate_detector` directory. Below are some key metrics:
-
-### Training and Validation Metrics
-
-- **Results**: The `results.png` and `results.csv` files show the training and validation metrics over time, including loss, precision, recall, and F1 score.
-
-![Training and Validation Metrics](runs/detects/license_plate_detector/results.png)
-
-### Confusion Matrix
-
-The confusion matrix provides insights into the model's performance in terms of true positives, false positives, true negatives, and false negatives.
-
-![Confusion Matrix](runs/detects/license_plate_detector/confusion_matrix.png)
-
-### Precision-Recall Curve
-
-The Precision-Recall curve helps evaluate the model's performance across different thresholds.
-
-![Precision-Recall Curve](runs/detects/license_plate_detector/PR_curve.png)
-
-### F1 Score Curve
-
-The F1 score curve represents the model's accuracy, considering both precision and recall.
-
-![F1 Score Curve](runs/detects/license_plate_detector/F1_curve.png)
+Logic tests always run; the pipeline smoke tests skip when weights are absent.
 
 ## Limitations
 
-- Works best with clear, well-lit images
-- Performance may vary depending on image quality
-- Processing speed depends on CPU capabilities
-
-## Tips for Better Results
-
-1. Use clear, high-resolution images
-2. Ensure good lighting conditions
-3. Try to capture images with the license plate facing directly towards the camera
-4. Avoid extreme angles or heavily skewed perspectives
+Plate text validation is generic (not country-specific beyond the Indian repair heuristic); single-line plates work best;
+`--ocr tesseract` was not exercised on this machine (Tesseract not installed).

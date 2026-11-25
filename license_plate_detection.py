@@ -1,475 +1,414 @@
-import cv2
-import numpy as np
-from ultralytics import YOLO
-import pytesseract
-from typing import List, Tuple
-import torch
-import os
-import time
+"""Licence plate detection (YOLO) + OCR (EasyOCR by default, Tesseract optional)."""
+from __future__ import annotations
+
 import hashlib
+import os
+import re
 import shutil
-import easyocr
-from imutils.perspective import four_point_transform
+import time
+from pathlib import Path
+from typing import List, Optional, Tuple
+
+import cv2
 import imutils
+import numpy as np
+from imutils.perspective import four_point_transform
+
+ROOT = Path(__file__).resolve().parent
+BUNDLED_WEIGHTS = ROOT / "models" / "plate_best.pt"
+LEGACY_WEIGHTS = ROOT / "runs" / "detects" / "license_plate_detector" / "weights" / "best.pt"
+ALLOWLIST = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+IMAGE_EXTS = (".jpg", ".jpeg", ".png", ".bmp", ".webp")
+VIDEO_EXTS = (".mp4", ".avi", ".mov", ".mkv")
+
+# Indian plate layout, e.g. KA01AB1234 (used only to repair O/0, I/1 style confusions)
+_INDIAN = re.compile(r"^[A-Z]{2}\d{2}[A-Z]{1,3}\d{4}$")
+_TO_DIGIT = {"O": "0", "Q": "0", "D": "0", "I": "1", "L": "1", "Z": "2", "S": "5", "B": "8", "G": "6"}
+_TO_ALPHA = {"0": "O", "1": "I", "2": "Z", "5": "S", "8": "B", "6": "G"}
+
+
+def default_weights() -> Path:
+    """Bundled weights first, then the legacy training output."""
+    for p in (BUNDLED_WEIGHTS, LEGACY_WEIGHTS):
+        if p.is_file():
+            return p
+    return BUNDLED_WEIGHTS
+
+
+def select_device(preferred: str = "auto") -> str:
+    import torch
+    if preferred != "auto":
+        return preferred
+    if torch.cuda.is_available():
+        return "cuda"
+    if getattr(torch.backends, "mps", None) and torch.backends.mps.is_available():
+        return "mps"
+    return "cpu"
+
+
+def validate_plate_text(text: str) -> str:
+    """Normalise OCR text; return '' when it cannot be a plate (4-10 chars, letters and digits)."""
+    text = "".join(c for c in (text or "") if c.isalnum() and c.isascii()).upper()
+    if not 4 <= len(text) <= 10:
+        return ""
+    if not (any(c.isalpha() for c in text) and any(c.isdigit() for c in text)):
+        return ""
+    return repair_indian_format(text)
+
+
+def repair_indian_format(text: str) -> str:
+    """If text is one or two character confusions away from an Indian plate layout, fix it."""
+    if _INDIAN.match(text) or not 9 <= len(text) <= 10:
+        return text
+    n_mid = len(text) - 8  # series letters: 1-2 when total is 9-10 (pattern: 2 + 2 + n + 4)
+    layout = "A" * 2 + "D" * 2 + "A" * n_mid + "D" * 4
+    out = []
+    for ch, kind in zip(text, layout):
+        if kind == "D" and ch.isalpha():
+            ch = _TO_DIGIT.get(ch, ch)
+        elif kind == "A" and ch.isdigit():
+            ch = _TO_ALPHA.get(ch, ch)
+        out.append(ch)
+    fixed = "".join(out)
+    return fixed if _INDIAN.match(fixed) else text
+
+
+def edit_distance(a: str, b: str) -> int:
+    prev = list(range(len(b) + 1))
+    for i, ca in enumerate(a, 1):
+        cur = [i]
+        for j, cb in enumerate(b, 1):
+            cur.append(min(prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + (ca != cb)))
+        prev = cur
+    return prev[-1]
+
+
+def sharpness(img: np.ndarray) -> float:
+    gray = img if img.ndim == 2 else cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    return float(cv2.Laplacian(gray, cv2.CV_64F).var())
+
+
+class PlateTracker:
+    """Collapses repeated reads of the same plate (exact or within 1 edit) into one entry."""
+
+    def __init__(self, max_distance: int = 1):
+        self.max_distance = max_distance
+        self.plates: dict = {}  # text -> best confidence
+
+    def update(self, text: str, conf: float) -> bool:
+        """Return True if this is a plate not seen before (so it should be logged)."""
+        for known in list(self.plates):
+            if edit_distance(known, text) <= self.max_distance and len(known) == len(text):
+                if conf > self.plates[known]:
+                    self.plates[known] = conf
+                return False
+        self.plates[text] = conf
+        return True
+
 
 class LicensePlateDetector:
+    """Detect plates with a YOLO model and read them with EasyOCR and/or Tesseract.
+
+    Args:
+        model_path: YOLO weights. Default: models/plate_best.pt (or the legacy runs/ path).
+        ocr: 'auto' (EasyOCR, falls back to Tesseract), 'easyocr', 'tesseract'.
+        device: 'auto', 'cpu', 'mps' or 'cuda'.
+        conf: YOLO confidence threshold.
+        save_dir: where unique plate crops are written (None disables saving).
+        debug_dir: where OCR inputs are dumped (None disables).
     """
-    A class to detect and recognize license plates in images and videos using YOLO and Tesseract OCR.
-    
-    This class handles the detection of license plates using a YOLO model, preprocessing of images,
-    OCR using Tesseract, and saving/logging of detected plates.
-    """
-    
-    def __init__(self, model_path: str = 'runs/detects/license_plate_detector/weights/best.pt'):
-        """
-        Initialize the license plate detector with YOLO model.
-        
-        Args:
-            model_path (str): Path to the YOLO model weights file.
-        """
-        self.model = YOLO(model_path)
-        
-        # Set path for Tesseract
-        tesseract_cmd = shutil.which('tesseract')
-        if tesseract_cmd:
-            pytesseract.pytesseract.tesseract_cmd = tesseract_cmd
-            self.use_tesseract = True
+
+    def __init__(self, model_path: Optional[str] = None, ocr: str = "auto", device: str = "auto",
+                 conf: float = 0.35, save_dir: Optional[str] = "detected_plates",
+                 debug_dir: Optional[str] = None, verbose: bool = True):
+        from ultralytics import YOLO
+
+        path = Path(model_path) if model_path else default_weights()
+        if not path.is_file():
+            raise FileNotFoundError(
+                f"Model weights not found: {path}\n"
+                "Use --weights PATH, restore models/plate_best.pt (git pull), or train one with train.py.")
+        self.device = select_device(device)
+        self.conf = conf
+        self.verbose = verbose
+        self.save_dir = Path(save_dir) if save_dir else None
+        self.debug_dir = Path(debug_dir) if debug_dir else None
+        self.model = YOLO(str(path))
+        self._log(f"Using device: {self.device}; weights: {path}")
+
+        self.use_tesseract = False
+        self.reader = None
+        self._init_ocr(ocr)
+        self.unique_plate_hashes: set = set()
+
+    def _log(self, msg: str) -> None:
+        if self.verbose:
+            print(msg)
+
+    # ---- OCR engines -------------------------------------------------------------------
+    def _init_ocr(self, ocr: str) -> None:
+        if ocr not in ("auto", "easyocr", "tesseract"):
+            raise ValueError("ocr must be auto, easyocr or tesseract")
+        if ocr in ("auto", "tesseract") and shutil.which("tesseract"):
+            try:
+                import pytesseract
+                pytesseract.pytesseract.tesseract_cmd = shutil.which("tesseract")
+                self.use_tesseract = ocr == "tesseract"  # in 'auto' EasyOCR is primary
+                self._pytesseract = pytesseract
+                self._tesseract_available = True
+            except ImportError:
+                self._tesseract_available = False
         else:
-            print("Warning: Tesseract not found. Please install it (brew install tesseract).")
-            self.use_tesseract = False
-            
-        # Check for MPS (Mac GPU) availability
-        self.device = 'mps' if torch.backends.mps.is_available() else 'cpu'
-        print(f"Using device: {self.device}")
-        
-        # Initialize EasyOCR reader
-        print("Initializing EasyOCR...")
-        # EasyOCR uses torch device detection, so gpu=True should use MPS if available
-        self.reader = easyocr.Reader(['en'], gpu=True)
-        
-        # Create directories for logs and detected plates
-        os.makedirs('plate_logs', exist_ok=True)
-        os.makedirs('detected_plates', exist_ok=True)
-        
-        # Initialize set to track unique plates
-        self.unique_plate_hashes = set()
-        
-    def compute_image_hash(self, image: np.ndarray) -> str:
-        """
-        Compute a hash of the image content for duplicate detection.
-        
-        Args:
-            image (np.ndarray): The image to hash.
-            
-        Returns:
-            str: The hash of the image.
-        """
-        # Resize image to a standard size to ensure consistent hashing
-        resized = cv2.resize(image, (100, 50))
-        # Convert to grayscale
-        gray = cv2.cvtColor(resized, cv2.COLOR_BGR2GRAY)
-        # Compute hash
+            self._tesseract_available = False
+        if ocr == "tesseract" and not self._tesseract_available:
+            raise RuntimeError("Tesseract requested but not found. Install it (brew install tesseract) "
+                               "and pip install pytesseract, or use --ocr easyocr.")
+        if ocr != "tesseract" or not self._tesseract_available:
+            import easyocr
+            self._log("Initialising EasyOCR (models download on first use)...")
+            gpu = self.device in ("cuda", "mps")
+            try:
+                self.reader = easyocr.Reader(["en"], gpu=gpu, verbose=False)
+            except Exception:
+                self.reader = easyocr.Reader(["en"], gpu=False, verbose=False)
+
+    def _ocr_easyocr(self, images: List[np.ndarray]) -> Tuple[str, float]:
+        best, best_score = ("", 0.0), 0.0
+        for img in images:
+            try:
+                results = self.reader.readtext(img, allowlist=ALLOWLIST, detail=1, paragraph=False,
+                                               decoder="beamsearch", beamWidth=5)
+            except Exception as e:  # MPS kernels can fail; retry on CPU once
+                if self.device == "mps":
+                    import easyocr
+                    self.reader = easyocr.Reader(["en"], gpu=False, verbose=False)
+                    self.device = "cpu"
+                    return self._ocr_easyocr(images)
+                self._log(f"EasyOCR error: {e}")
+                continue
+            if not results:
+                continue
+            # plates are often split into several boxes and may include an "IND" badge: build candidates
+            # from the joined boxes (badge removed) and from each single box, prefer valid Indian layouts
+            results = sorted(results, key=lambda r: r[0][0][0])
+            body = [r for r in results if r[1] not in ("IND", "ND", "ID")]
+            cands = []
+            if body:
+                cands.append(("".join(r[1] for r in body), float(np.mean([r[2] for r in body]))))
+            cands += [(r[1], float(r[2])) for r in body]
+            for raw, conf in cands:
+                text = validate_plate_text(raw)
+                if not text:
+                    continue
+                score = conf + (1.0 if _INDIAN.match(text) else 0.0)
+                if score > best_score:
+                    best, best_score = (text, conf), score
+        return best
+
+    def _ocr_tesseract(self, images: List[np.ndarray]) -> Tuple[str, float]:
+        best = ("", 0.0)
+        for img in images:
+            for psm in (7, 8, 6):
+                try:
+                    data = self._pytesseract.image_to_data(
+                        img, output_type=self._pytesseract.Output.DICT,
+                        config=f"--psm {psm} --oem 3 -c tessedit_char_whitelist={ALLOWLIST}")
+                except Exception as e:
+                    self._log(f"Tesseract error: {e}")
+                    return best
+                pairs = [(w, float(c)) for w, c in zip(data["text"], data["conf"]) if w.strip() and float(c) >= 0]
+                if not pairs:
+                    continue
+                text = validate_plate_text("".join(w for w, _ in pairs))
+                conf = float(np.mean([c for _, c in pairs])) / 100.0
+                if text and conf > best[1]:
+                    best = (text, conf)
+        return best
+
+    # ---- image helpers ------------------------------------------------------------------
+    @staticmethod
+    def compute_image_hash(image: np.ndarray) -> str:
+        gray = cv2.cvtColor(cv2.resize(image, (100, 50)), cv2.COLOR_BGR2GRAY)
         return hashlib.md5(gray.tobytes()).hexdigest()
-        
-    def save_unique_plate(self, plate_img: np.ndarray, text: str, confidence: float, idx: int) -> bool:
-        """
-        Save plate image if it's unique based on content hash and text.
-        
-        Args:
-            plate_img (np.ndarray): The image of the detected plate.
-            text (str): The recognized text from the plate.
-            confidence (float): The confidence score of the detection.
-            idx (int): The index of the detection.
-            
-        Returns:
-            bool: True if the plate was saved, False otherwise.
-        """
-        img_hash = self.compute_image_hash(plate_img)
-        
-        if img_hash not in self.unique_plate_hashes:
-            self.unique_plate_hashes.add(img_hash)
-            
-            # Create filename with text if available
-            timestamp = time.strftime("%Y%m%d-%H%M%S")
-            if text:
-                filename = f"detected_plates/plate_{text}_{confidence:.2f}_{timestamp}.png"
-            else:
-                filename = f"detected_plates/plate_unknown_{timestamp}_{idx}.png"
-            
-            # Save both original and preprocessed versions
-            cv2.imwrite(filename, plate_img)
-            
-            # Save preprocessed version with _processed suffix
-            thresh = self.preprocess_plate(plate_img)
-            processed_filename = filename.replace('.png', '_processed.png')
-            cv2.imwrite(processed_filename, thresh)
-            
-            return True
-        return False
 
     def preprocess_plate(self, plate_img: np.ndarray) -> np.ndarray:
-        """
-        Preprocess the license plate image for better OCR.
-        Includes deskewing and enhancement.
-        """
-        # 1. Deskewing attempt
-        gray = cv2.cvtColor(plate_img, cv2.COLOR_BGR2GRAY)
-        
-        # Find contours to detect the actual plate polygon within the crop
-        blurred = cv2.GaussianBlur(gray, (5, 5), 0)
-        edged = cv2.Canny(blurred, 75, 200)
-        cnts = cv2.findContours(edged.copy(), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        cnts = imutils.grab_contours(cnts)
-        cnts = sorted(cnts, key=cv2.contourArea, reverse=True)[:5]
-        
-        display_cnt = None
+        """Grayscale, optional perspective fix, upscale, CLAHE contrast boost, white border."""
+        gray = cv2.cvtColor(plate_img, cv2.COLOR_BGR2GRAY) if plate_img.ndim == 3 else plate_img
+        edged = cv2.Canny(cv2.GaussianBlur(gray, (5, 5), 0), 75, 200)
+        cnts = sorted(imutils.grab_contours(cv2.findContours(edged, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)),
+                      key=cv2.contourArea, reverse=True)[:5]
+        warped = gray
         for c in cnts:
-            peri = cv2.arcLength(c, True)
-            approx = cv2.approxPolyDP(c, 0.02 * peri, True)
-            if len(approx) == 4:
-                display_cnt = approx
+            approx = cv2.approxPolyDP(c, 0.02 * cv2.arcLength(c, True), True)
+            # only trust a quad covering most of the crop; otherwise we would crop away characters
+            if len(approx) == 4 and cv2.contourArea(approx) > 0.6 * gray.shape[0] * gray.shape[1]:
+                warped = four_point_transform(gray, approx.reshape(4, 2))
                 break
-        
-        # If we found a 4-point contour, warp it
-        if display_cnt is not None:
-            warped = four_point_transform(gray, display_cnt.reshape(4, 2))
-        else:
-            warped = gray
-            
-        # 2. Enhancement
-        # Resize to make text bigger (helps OCR)
-        scale = 3.0
-        warped = cv2.resize(warped, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
-        
-        # Denoise
-        denoised = cv2.fastNlMeansDenoising(warped, None, 30, 7, 21)
-        
-        # CLAHE
-        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
-        enhanced = clahe.apply(denoised)
-        
-        # Thresholding can sometimes lose details, so we return the enhanced grayscale
-        # Tesseract and EasyOCR handle internal binarization well
-        
-        # Add a white border to give OCR more breathing room
-        enhanced = cv2.copyMakeBorder(enhanced, 20, 20, 20, 20, cv2.BORDER_CONSTANT, value=(255, 255, 255))
-        
-        return enhanced
+        warped = cv2.resize(warped, None, fx=3.0, fy=3.0, interpolation=cv2.INTER_CUBIC)
+        warped = cv2.GaussianBlur(warped, (3, 3), 0)
+        enhanced = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8)).apply(warped)
+        return cv2.copyMakeBorder(enhanced, 20, 20, 20, 20, cv2.BORDER_CONSTANT, value=255)
 
     def validate_plate_text(self, text: str) -> str:
-        """
-        Validate and clean the detected license plate text.
-        
-        Args:
-            text (str): The text to validate.
-            
-        Returns:
-            str: The validated and cleaned text.
-        """
-        # Remove any non-alphanumeric characters
-        text = ''.join(c for c in text if c.isalnum())
-        
-        # Convert to uppercase
-        text = text.upper()
-        
-        # Check minimum length and format
-        if len(text) < 4 or len(text) > 10:
-            return ""
-            
-        # Heuristic: Plates usually have a mix of letters and numbers
-        has_letters = any(c.isalpha() for c in text)
-        has_numbers = any(c.isdigit() for c in text)
-        if not (has_letters and has_numbers):
-            return ""
-            
-        return text
-    
-    def process_frame(self, frame: np.ndarray) -> Tuple[np.ndarray, List[str]]:
-        """
-        Process a single frame to detect and recognize license plates.
-        
-        Args:
-            frame (np.ndarray): The input frame/image in BGR format.
-            
-        Returns:
-            Tuple[np.ndarray, List[str]]: The processed frame with annotations and a list of recognized plate texts.
-        """
-        # Detect license plates with higher confidence threshold
-        results = self.model(frame, conf=0.35)[0]
-        plate_texts = []
-        
-        # Process each detection
-        for idx, box in enumerate(results.boxes):
-            # Get coordinates and confidence
-            x1, y1, x2, y2 = map(int, box.xyxy[0])
-            confidence = float(box.conf[0])
-            
-            # Draw bounding box always
-            cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
-            label = None
-            
-            # Crop the license plate region with padding
-            padding = 10
-            y1_pad = max(0, y1 - padding)
-            y2_pad = min(frame.shape[0], y2 + padding)
-            x1_pad = max(0, x1 - padding)
-            x2_pad = min(frame.shape[1], x2 + padding)
-            plate_img = frame[y1_pad:y2_pad, x1_pad:x2_pad]
-            
-            if plate_img.size > 0:
-                # Resize plate image if too small
-                min_width = 150
-                if plate_img.shape[1] < min_width:
-                    scale = min_width / plate_img.shape[1]
-                    plate_img = cv2.resize(plate_img, None, fx=scale, fy=scale)
-                
-                # Try multiple OCR configurations
-                text = ""
-                best_conf = 0.0
-                
-                # Preprocess plate once for both OCR engines
-                thresh = self.preprocess_plate(plate_img)
-                
-                # 1. Try Tesseract first (faster)
-                if self.use_tesseract:
-                    try:
-                        # Try different PSM modes
-                        for psm in [7, 8, 6]:
-                            tess_text = pytesseract.image_to_string(thresh, 
-                                                             config=f'--psm {psm} --oem 3 -c tessedit_char_whitelist=ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789')
-                            clean_text = self.validate_plate_text(tess_text)
-                            if clean_text:
-                                text = clean_text
-                                best_conf = 0.8 # Tesseract doesn't give easy confidence for string, assume high if validated
-                                break
-                    except Exception as e:
-                        print(f"Tesseract Error: {str(e)}")
-                
-                # 2. If Tesseract failed or we want to double check, use EasyOCR
-                if not text:
-                    try:
-                        # EasyOCR works better on raw or slightly processed images
-                        # We pass the cropped plate directly
-                        # Use allowlist to restrict to alphanumeric characters
-                        # Pass the preprocessed image (deskewed & enhanced) to EasyOCR
-                        
-                        # DEBUG: Save the images being sent to OCR
-                        os.makedirs('debug_plates', exist_ok=True)
-                        timestamp = time.strftime("%H%M%S")
-                        cv2.imwrite(f'debug_plates/plate_{timestamp}_{idx}_processed.png', thresh)
-                        cv2.imwrite(f'debug_plates/plate_{timestamp}_{idx}_raw.png', plate_img)
-                        
-                        ocr_results = self.reader.readtext(
-                            thresh, 
-                            allowlist='ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789',
-                            detail=1,
-                            paragraph=False,
-                            decoder='beamsearch',
-                            beamWidth=10
-                        )
-                        
-                        # Fallback: If preprocessing hurt the image, try the raw color crop
-                        if not ocr_results:
-                            ocr_results = self.reader.readtext(
-                                plate_img,
-                                allowlist='ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789',
-                                detail=1,
-                                paragraph=False,
-                                decoder='beamsearch',
-                                beamWidth=5
-                            )
-                        
-                        for (_, ocr_text, ocr_conf) in ocr_results:
-                            clean_text = self.validate_plate_text(ocr_text)
-                            if clean_text and ocr_conf > 0.4:
-                                text = clean_text
-                                best_conf = ocr_conf
-                                break
-                    except Exception as e:
-                        print(f"EasyOCR Error: {str(e)}")
-                
-                if text:
-                    plate_texts.append((text, confidence))
-                    label = f"{text} ({confidence:.2f})"
-                
-                # Save plate image if it's unique
-                if self.save_unique_plate(plate_img, text, confidence, idx):
-                    print(f"New unique plate detected and saved!")
-            
-            # Draw label if available, else just confidence
-            if label:
-                # Draw with background for better visibility
-                label_size = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.9, 2)[0]
-                cv2.rectangle(frame, (x1, y1-30), (x1 + label_size[0], y1), (0, 255, 0), -1)
-                cv2.putText(frame, label, (x1, y1-10), 
-                          cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 0, 0), 2)
-            else:
-                cv2.putText(frame, f"Conf: {confidence:.2f}", (x1, y1-10), 
-                          cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 255, 0), 2)
-        
-        return frame, plate_texts
+        return validate_plate_text(text)
 
-    def process_video(self, source='0'):
-        """
-        Process video from file or webcam.
-        
-        Args:
-            source (str): '0' for webcam or path to video file.
-        """
-        # Create output directories if they don't exist
-        os.makedirs('output_results', exist_ok=True)
-        os.makedirs('plate_logs', exist_ok=True)
-        
-        # Create log file for detected plates
-        timestamp = time.strftime("%Y%m%d-%H%M%S")
-        log_filename = f'plate_logs/detected_plates_{timestamp}.txt'
-        video_name = source if source == '0' else os.path.basename(source)
-        
-        with open(log_filename, 'w') as log_file:
-            log_file.write(f"License Plate Detection Log\n")
-            log_file.write(f"Video Source: {video_name}\n")
-            log_file.write(f"Date: {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
-            log_file.write("-" * 50 + "\n\n")
-        
-        # Open video source
-        cap = cv2.VideoCapture(source if source != '0' else 0)
+    def read_plate(self, plate_img: np.ndarray) -> Tuple[str, float]:
+        """OCR a cropped plate. Returns ('', 0.0) if unreadable."""
+        if plate_img is None or plate_img.size == 0 or min(plate_img.shape[:2]) < 8:
+            return "", 0.0
+        if plate_img.shape[1] < 150:
+            s = 150 / plate_img.shape[1]
+            plate_img = cv2.resize(plate_img, None, fx=s, fy=s, interpolation=cv2.INTER_CUBIC)
+        variants = [plate_img, self.preprocess_plate(plate_img)]
+        if self.debug_dir:
+            self.debug_dir.mkdir(parents=True, exist_ok=True)
+            stamp = f"{time.time_ns()}"
+            cv2.imwrite(str(self.debug_dir / f"{stamp}_processed.png"), variants[1])
+            cv2.imwrite(str(self.debug_dir / f"{stamp}_raw.png"), plate_img)
+        if self.reader is not None and not self.use_tesseract:
+            text, conf = self._ocr_easyocr(variants)
+            if not text and self._tesseract_available:
+                text, conf = self._ocr_tesseract(variants[1:])
+            return text, conf
+        text, conf = self._ocr_tesseract(variants)
+        if not text and self.reader is not None:
+            text, conf = self._ocr_easyocr(variants)
+        return text, conf
+
+    def save_unique_plate(self, plate_img: np.ndarray, text: str, confidence: float, idx: int = 0) -> bool:
+        if self.save_dir is None:
+            return False
+        h = self.compute_image_hash(plate_img)
+        if h in self.unique_plate_hashes:
+            return False
+        self.unique_plate_hashes.add(h)
+        self.save_dir.mkdir(parents=True, exist_ok=True)
+        stamp = f"{time.strftime('%Y%m%d-%H%M%S')}_{time.time_ns() % 10**6:06d}"
+        name = f"plate_{text}_{confidence:.2f}_{stamp}.png" if text else f"plate_unknown_{stamp}_{idx}.png"
+        cv2.imwrite(str(self.save_dir / name), plate_img)
+        return True
+
+    # ---- detection ----------------------------------------------------------------------
+    def detect(self, frame: np.ndarray) -> List[Tuple[int, int, int, int, float]]:
+        res = self.model.predict(frame, conf=self.conf, device=self.device, verbose=False)[0]
+        out = []
+        for box in res.boxes:
+            x1, y1, x2, y2 = map(int, box.xyxy[0].tolist())
+            out.append((x1, y1, x2, y2, float(box.conf[0])))
+        return out
+
+    def process_frame(self, frame: np.ndarray, annotate: bool = True) -> Tuple[np.ndarray, List[Tuple[str, float]]]:
+        """Detect and read plates in a BGR frame. Returns (annotated copy, [(text, det_confidence)])."""
+        if frame is None or frame.size == 0:
+            raise ValueError("Empty frame")
+        out = frame.copy() if annotate else frame
+        plate_texts: List[Tuple[str, float]] = []
+        H, W = frame.shape[:2]
+        for idx, (x1, y1, x2, y2, conf) in enumerate(self.detect(frame)):
+            pad = 10
+            crop = frame[max(0, y1 - pad):min(H, y2 + pad), max(0, x1 - pad):min(W, x2 + pad)]
+            text, ocr_conf = self.read_plate(crop)
+            if text:
+                plate_texts.append((text, conf))
+            if crop.size:
+                self.save_unique_plate(crop, text, conf, idx)
+            if annotate:
+                cv2.rectangle(out, (x1, y1), (x2, y2), (0, 255, 0), 2)
+                label = f"{text} ({conf:.2f})" if text else f"plate? {conf:.2f}"
+                scale = max(0.5, min(1.2, W / 1400))
+                tw, th = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, scale, 2)[0]
+                top = max(th + 8, y1)
+                cv2.rectangle(out, (x1, top - th - 8), (x1 + tw, top), (0, 255, 0), -1)
+                cv2.putText(out, label, (x1, top - 4), cv2.FONT_HERSHEY_SIMPLEX, scale, (0, 0, 0), 2)
+        return out, plate_texts
+
+    def process_image(self, path: str, output_dir: str = "output_results") -> List[Tuple[str, float]]:
+        img = cv2.imread(str(path))
+        if img is None:
+            raise ValueError(f"Could not read image: {path}")
+        out, plates = self.process_frame(img)
+        Path(output_dir).mkdir(parents=True, exist_ok=True)
+        dest = Path(output_dir) / f"{Path(path).stem}_processed.jpg"
+        cv2.imwrite(str(dest), out)
+        self._log(f"{path}: {[p[0] for p in plates] or 'no plate read'} -> {dest}")
+        return plates
+
+    def process_video(self, source: str = "0", output_dir: str = "output_results", log_dir: str = "plate_logs",
+                      display: Optional[bool] = None, stride: int = 3, max_frames: Optional[int] = None,
+                      target_size: Tuple[int, int] = (1280, 720)) -> dict:
+        """Process a video file or webcam ('0'). Returns a summary dict (unique plates, frames...)."""
+        is_cam = str(source).isdigit()
+        if not is_cam and not Path(source).is_file():
+            raise FileNotFoundError(f"Video not found: {source}")
+        cap = cv2.VideoCapture(int(source) if is_cam else str(source))
         if not cap.isOpened():
-            print(f"Error: Could not open video source {source}")
-            return
-            
-        # Set target resolution
-        target_width = 1280
-        target_height = 720
-            
-        # Create output video writer if source is a file
-        out = None
-        if source != '0':
-            base_name = os.path.splitext(os.path.basename(source))[0]
-            output_path = os.path.join('output_results', f'{base_name}_processed.mp4')
-            
-            # Get input video FPS
-            input_fps = cap.get(cv2.CAP_PROP_FPS)
-            if not input_fps or input_fps < 1:
-                input_fps = 30.0
-            
-            # Use x264 codec for better compatibility
-            fourcc = cv2.VideoWriter_fourcc(*'avc1')
-            out = cv2.VideoWriter(output_path, fourcc, input_fps, (target_width, target_height))
-            print(f"\nProcessed video will be saved to: {output_path}")
-            print(f"Detected plates will be logged to: {log_filename}")
-            
-        print("\nPress 'q' to quit")
-        frame_count = 0
-        unique_plates = set()  # Track unique plates to avoid duplicates
-        
-        while cap.isOpened():
-            ret, frame = cap.read()
-            if not ret:
-                break
-                
-            frame_count += 1
-            
-            # Process every 3rd frame to improve performance
-            if frame_count % 3 != 0:
-                continue
-                
-            # Resize frame while maintaining aspect ratio
-            h, w = frame.shape[:2]
-            scale = min(target_width/w, target_height/h)
-            new_w, new_h = int(w * scale), int(h * scale)
-            
-            # Resize the frame
-            frame = cv2.resize(frame, (new_w, new_h))
-            
-            # Create black canvas of target size
-            canvas = np.zeros((target_height, target_width, 3), dtype=np.uint8)
-            
-            # Calculate position to paste the resized frame
-            y_offset = (target_height - new_h) // 2
-            x_offset = (target_width - new_w) // 2
-            
-            # Paste the resized frame onto the canvas
-            canvas[y_offset:y_offset+new_h, x_offset:x_offset+new_w] = frame
-                
-            # Process frame
-            processed_frame, plates = self.process_frame(canvas)
-            
-            # Show detections
-            cv2.imshow("License Plate Detection", processed_frame)
-            
-            # Save frame if writing video
-            if out is not None:
-                out.write(processed_frame)
-            
-            # Log and display detected plates
-            if plates:
-                current_time = time.strftime("%H:%M:%S")
-                
-                # Clear terminal and show current detections
-                os.system('cls' if os.name == 'nt' else 'clear')
-                print("\nDetected License Plates:")
-                print("-" * 30)
-                
-                with open(log_filename, 'a') as log_file:
-                    for text, conf in plates:
-                        if text not in unique_plates:  # Log only new unique plates
-                            unique_plates.add(text)
-                            log_entry = f"Time: {current_time} | Plate: {text} | Confidence: {conf:.2f}\n"
-                            log_file.write(log_entry)
-                        
-                        # Display in terminal
-                        print(f"Plate: {text}")
-                        print(f"Confidence: {conf:.2f}")
-                        print("-" * 30)
-            
-            # Break on 'q' press
-            if cv2.waitKey(1) & 0xFF == ord('q'):
-                break
-        
-        # Write summary to log file
-        with open(log_filename, 'a') as log_file:
-            log_file.write("\n" + "=" * 50 + "\n")
-            log_file.write(f"Summary:\n")
-            log_file.write(f"Total unique plates detected: {len(unique_plates)}\n")
-            log_file.write("All unique plates:\n")
-            for plate in sorted(unique_plates):
-                log_file.write(f"- {plate}\n")
-        
+            raise RuntimeError(f"Could not open video source: {source} (unsupported codec or no camera access?)")
+        if display is None:
+            display = True
+        tw, th = target_size
+
+        Path(log_dir).mkdir(parents=True, exist_ok=True)
+        log_path = Path(log_dir) / f"detected_plates_{time.strftime('%Y%m%d-%H%M%S')}.txt"
+        writer = None
+        out_path = None
+        if not is_cam:
+            Path(output_dir).mkdir(parents=True, exist_ok=True)
+            out_path = Path(output_dir) / f"{Path(source).stem}_processed.mp4"
+            fps = cap.get(cv2.CAP_PROP_FPS)
+            fps = fps if fps and fps >= 1 else 30.0
+            writer = cv2.VideoWriter(str(out_path), cv2.VideoWriter_fourcc(*"mp4v"), fps / max(1, stride), (tw, th))
+
+        tracker = PlateTracker()
+        n_read = n_proc = frames_with_plate = 0
+        with open(log_path, "w") as log:
+            log.write(f"License Plate Detection Log\nSource: {source}\nDate: {time.strftime('%Y-%m-%d %H:%M:%S')}\n"
+                      + "-" * 50 + "\n")
+            while True:
+                ok, frame = cap.read()
+                if not ok or frame is None:
+                    break
+                n_read += 1
+                if n_read % max(1, stride) != 0:
+                    continue
+                h, w = frame.shape[:2]
+                s = min(tw / w, th / h)
+                nw, nh = max(1, int(w * s)), max(1, int(h * s))
+                canvas = np.zeros((th, tw, 3), np.uint8)
+                yo, xo = (th - nh) // 2, (tw - nw) // 2
+                canvas[yo:yo + nh, xo:xo + nw] = cv2.resize(frame, (nw, nh))
+                shown, plates = self.process_frame(canvas)
+                n_proc += 1
+                frames_with_plate += bool(plates)
+                if writer is not None:
+                    writer.write(shown)
+                for text, conf in plates:
+                    if tracker.update(text, conf):
+                        entry = f"Frame {n_read} | Plate: {text} | Confidence: {conf:.2f}"
+                        log.write(entry + "\n")
+                        log.flush()
+                        self._log(entry)
+                if display:
+                    try:
+                        cv2.imshow("License Plate Detection", shown)
+                        if cv2.waitKey(1) & 0xFF == ord("q"):
+                            break
+                    except cv2.error:
+                        self._log("No display available (headless OpenCV): continuing without a window.")
+                        display = False
+                if max_frames and n_proc >= max_frames:
+                    break
+            log.write("\n" + "=" * 50 + f"\nUnique plates: {len(tracker.plates)}\n")
+            for p, c in sorted(tracker.plates.items()):
+                log.write(f"- {p} (best conf {c:.2f})\n")
         cap.release()
-        if out is not None:
-            out.release()
-        cv2.destroyAllWindows()
-        
-        print(f"\nDetection completed!")
-        print(f"Detected plates have been saved to: {log_filename}")
-
-def main():
-    # Initialize detector with fine-tuned model path
-    detector = LicensePlateDetector()
-    
-    # List available test videos
-    video_dir = "Testing Videos"
-    if os.path.exists(video_dir):
-        videos = [f for f in os.listdir(video_dir) if f.endswith(('.mp4', '.avi', '.mov'))]
-        if videos:
-            print("\nAvailable test videos:")
-            for i, video in enumerate(videos, 1):
-                print(f"{i}. {video}")
-            
-            choice = input("\nEnter video number (or press Enter for webcam): ").strip()
-            if choice and choice.isdigit() and 1 <= int(choice) <= len(videos):
-                video_path = os.path.join(video_dir, videos[int(choice)-1])
-                print(f"\nProcessing video: {videos[int(choice)-1]}")
-                detector.process_video(video_path)
-            else:
-                print("\nStarting webcam feed...")
-                detector.process_video('0')
-        else:
-            print("\nNo test videos found. Starting webcam feed...")
-            detector.process_video('0')
-    else:
-        print("\nStarting webcam feed...")
-        detector.process_video('0')
-
-if __name__ == "__main__":
-    main()
+        if writer is not None:
+            writer.release()
+        try:
+            cv2.destroyAllWindows()
+        except cv2.error:
+            pass
+        if n_read == 0:
+            self._log(f"Warning: no frames could be read from {source}")
+        self._log(f"Done: {n_proc} frames processed, {len(tracker.plates)} unique plates. Log: {log_path}")
+        return {"frames_read": n_read, "frames_processed": n_proc, "frames_with_plate": frames_with_plate,
+                "plates": dict(tracker.plates), "log": str(log_path), "video": str(out_path) if out_path else None}

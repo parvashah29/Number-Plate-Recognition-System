@@ -1,4 +1,4 @@
-path: ./archive  # dataset root directory
+path: ./archive  # NOTE: train.py writes its own absolute-path yaml; this file is for manual `yolo train data=...`
 train: images/train  # train images relative to 'path'
 val: images/val  # val images relative to 'path'
 

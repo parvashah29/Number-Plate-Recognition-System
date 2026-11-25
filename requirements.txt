@@ -1,8 +1,8 @@
-ultralytics>=8.0.0
+ultralytics>=8.3.0
 opencv-python>=4.8.0
 numpy>=1.24.3
-pytesseract>=0.3.10
-imutils>=0.5.4
-supervision>=0.11.1
-torch>=2.0.0
 easyocr>=1.7.0
+imutils>=0.5.4
+torch>=2.0.0
+# optional: second OCR engine (also needs the tesseract binary, e.g. `brew install tesseract`)
+# pytesseract>=0.3.10
